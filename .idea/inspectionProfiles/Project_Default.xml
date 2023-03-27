@@ -1,0 +1,15 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="PyUnresolvedReferencesInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredIdentifiers">
+        <list>
+          <option value="pandas.DataFrame" />
+          <option value="airflow.operators.python_operator" />
+          <option value="airflow.hooks.base_hook" />
+          <option value="airflow.providers.postgres" />
+        </list>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>
