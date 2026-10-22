@@ -1,183 +1,189 @@
-import argparse
-import configparser
-import datetime
-import gzip
 import logging
 import os
 import subprocess
 import psycopg2
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 
-BACKUP_PATH = '/tmp/'
 
-
-def compress_file(src_file):
-    compressed_file = "{}.gz".format(str(src_file))
-    with open(src_file, 'rb') as f_in:
-        with gzip.open(compressed_file, 'wb') as f_out:
-            for line in f_in:
-                f_out.write(line)
-    return compressed_file
-
-
-def extract_file(src_file):
-    extracted_file, extension = os.path.splitext(src_file)
-    print(extracted_file)
-    with gzip.open(src_file, 'rb') as f_in:
-        with open(extracted_file, 'wb') as f_out:
-            for line in f_in:
-                f_out.write(line)
-    return extracted_file
-
-
-def create_db(db_host, database, db_port, user_name, user_password):
-    try:
-        con = psycopg2.connect(dbname='postgres', port=db_port,
-                               user=user_name, host=db_host,
-                               password=user_password)
-
-    except Exception as e:
-        print(e)
-        exit(1)
-
-    con.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
-    cur = con.cursor()
-    try:
-        cur.execute("DROP DATABASE {} ;".format(database))
-    except Exception as e:
-        print('DB does not exist, nothing to drop')
-    cur.execute("CREATE DATABASE {} ;".format(database))
-    cur.execute("GRANT ALL PRIVILEGES ON DATABASE {} TO {} ;".format(database, user_name))
-    return database
-
-
-def backup_postgres_db(source_host, database_name, port, user, password, dest_file):
-    """
-    Backup postgres db to a file.
-    """
-
-    try:
-        process = subprocess.Popen(
-            ['pg_dump',
-             '--dbname=postgresql://{}:{}@{}:{}/{}'.format(user, password, source_host, port, database_name),
-             '-Fc',
-             '-f', dest_file,
-             '-v'],
-            stdout=subprocess.PIPE
-        )
-        output = process.communicate()[0]
-        if int(process.returncode) != 0:
-            print('Command failed. Return code : {}'.format(process.returncode))
-            exit(1)
-        return output
-    except Exception as e:
-        print(e)
-        exit(1)
-
-
-def restore_postgres_db(db_host, db, port, user, password, backup_file):
-    """
-    Restore postgres db from a file.
-    """
-
-    try:
-        print(user, password, db_host, port, db)
-        process = subprocess.Popen(
-            ['pg_restore',
-             '--no-owner',
-             '--dbname=postgresql://{}:{}@{}:{}/{}'.format(user, password, db_host, port, db),
-             '-v',
-             backup_file],
-            stdout=subprocess.PIPE
-        )
-        output = process.communicate()[0]
-        if int(process.returncode) != 0:
-            print('Command failed. Return code : {}'.format(process.returncode))
-
-        return output
-    except Exception as e:
-        print("Issue with the db restore : {}".format(e))
-
-
-def main():
+def setup_logger():
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.INFO)
     handler = logging.StreamHandler()
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     handler.setFormatter(formatter)
     logger.addHandler(handler)
-    args_parser = argparse.ArgumentParser(description='Postgres database management')
-    args_parser.add_argument("--action",
-                             metavar="action",
-                             choices=['restore', 'backup'],
-                             required=True)
-    args_parser.add_argument("--dest-db",
-                             metavar="dest_db",
-                             default=None,
-                             help="Name of the new restored database")
-    args_parser.add_argument("--configfile",
-                             required=True,
-                             help="Database configuration file")
-    args = args_parser.parse_args()
+    return logger
 
-    config = configparser.ConfigParser()
-    config.read(args.configfile)
 
-    postgres_source_host = config.get('postgresql', 'source_host')
-    postgres_db_host = config.get('postgresql', 'db_host')
-    postgres_port = config.get('postgresql', 'port')
-    postgres_db = config.get('postgresql', 'db')
-    postgres_restore = "{}_restore".format(postgres_db)
-    postgres_user = config.get('postgresql', 'user')
-    postgres_password = config.get('postgresql', 'password')
-    timestr = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-    filename = 'backup-{}-{}.dump'.format(timestr, postgres_db)
-    filename_compressed = '{}.gz'.format(filename)
-    restore_filename = '/tmp/restore.dump.gz'
-    restore_uncompressed = '/tmp/restore.dump'
-    local_file_path = '{}{}'.format(BACKUP_PATH, filename)
+def recreate_db(db_host, database, db_port, user_name, user_password, logger):
+    logger.info(f"Connecting to {db_host}:{db_port} to recreate database {database}")
+    try:
+        # Connect to default 'postgres' database to drop/create other databases
+        con = psycopg2.connect(
+            dbname='postgres',
+            port=db_port,
+            user=user_name,
+            host=db_host,
+            password=user_password
+        )
+    except psycopg2.Error as e:
+        logger.error(f"Error connecting to postgres database to recreate {database}: {e}")
+        raise
 
-    # backup task
-    if args.action == "backup":
-        logger.info('Backing up {} database to {}'.format(postgres_db, local_file_path))
-        result = backup_postgres_db(postgres_source_host,
-                                    postgres_db,
-                                    postgres_port,
-                                    postgres_user,
-                                    postgres_password,
-                                    local_file_path)
-        for line in result.splitlines():
-            logger.info(line)
+    con.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
+    cur = con.cursor()
 
-        logger.info("Backup complete")
-        logger.info("Compressing {}".format(local_file_path))
-        comp_file = compress_file(local_file_path)
+    try:
+        # Disconnect other clients before dropping the db if necessary
+        cur.execute(f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{database}';")
+        cur.execute(f"DROP DATABASE IF EXISTS {database};")
+        logger.info(f"Dropped database {database} if it existed.")
+    except psycopg2.Error as e:
+        logger.error(f"Error dropping database {database}: {e}")
 
-    # restore task
-    elif args.action == "restore":
+    try:
+        cur.execute(f"CREATE DATABASE {database};")
+        logger.info(f"Created database {database}.")
+        cur.execute(f"GRANT ALL PRIVILEGES ON DATABASE {database} TO {user_name};")
+        logger.info(f"Granted privileges to {user_name} on {database}.")
+    except psycopg2.Error as e:
+        logger.error(f"Error creating database {database}: {e}")
+        raise
+    finally:
+        cur.close()
+        con.close()
 
-        logger.info("Creating temp database for restore : {}".format(postgres_restore))
-        tmp_database = create_db(postgres_db_host,
-                                 postgres_restore,
-                                 postgres_port,
-                                 postgres_user,
-                                 postgres_password)
-        logger.info("Created temp database for restore : {}".format(tmp_database))
-        logger.info("Restore starting")
-        result = restore_postgres_db(postgres_db_host,
-                                     postgres_restore,
-                                     postgres_port,
-                                     postgres_user,
-                                     postgres_password,
-                                     restore_uncompressed
-                                     )
-        for line in result.splitlines():
-            logger.info(line)
-        logger.info("Restore complete")
 
-    else:
-        logger.warning("No valid argument was given.")
-        logger.warning(args)
+def backup_postgres_db(source_host, database_name, port, user, password, dest_file, logger):
+    """
+    Backup postgres db to a file.
+    """
+    logger.info(f"Backing up database {database_name} from {source_host} to {dest_file}")
+
+    os.environ['PGPASSWORD'] = password
+
+    try:
+        process = subprocess.Popen(
+            ['pg_dump',
+             '-h', source_host,
+             '-p', port,
+             '-U', user,
+             '-d', database_name,
+             '-Fc', # Custom format
+             '-f', dest_file,
+             '-v'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        stdout, stderr = process.communicate()
+
+        if process.returncode != 0:
+            logger.error(f"pg_dump failed with return code {process.returncode}")
+            logger.error(f"pg_dump stderr: {stderr.decode('utf-8')}")
+            raise Exception("pg_dump command failed")
+
+        logger.info("Backup completed successfully.")
+    except Exception as e:
+        logger.error(f"Error during backup: {e}")
+        raise
+    finally:
+        del os.environ['PGPASSWORD']
+
+
+def restore_postgres_db(db_host, db, port, user, password, backup_file, logger):
+    """
+    Restore postgres db from a file.
+    """
+    logger.info(f"Restoring database {db} on {db_host} from {backup_file}")
+
+    os.environ['PGPASSWORD'] = password
+
+    try:
+        process = subprocess.Popen(
+            ['pg_restore',
+             '-h', db_host,
+             '-p', port,
+             '-U', user,
+             '-d', db,
+             '--no-owner',
+             '--role', user,
+             '-v',
+             backup_file],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        stdout, stderr = process.communicate()
+
+        # pg_restore often throws warnings that are non-fatal, but a non-zero return code
+        # may indicate serious issues. We will log the stderr.
+        if process.returncode != 0:
+            logger.warning(f"pg_restore finished with return code {process.returncode}. Stderr: {stderr.decode('utf-8')}")
+        else:
+            logger.info("Restore completed successfully.")
+
+    except Exception as e:
+        logger.error(f"Issue with the db restore: {e}")
+        raise
+    finally:
+        del os.environ['PGPASSWORD']
+
+
+def main():
+    logger = setup_logger()
+
+    # Load configuration from environment variables
+    source_db_host = os.getenv('SOURCE_DB_HOST', 'transactional')
+    source_db_port = os.getenv('SOURCE_DB_PORT', '5432')
+    source_db_name = os.getenv('SOURCE_DB_NAME', 'dvdrental')
+    source_db_user = os.getenv('SOURCE_DB_USER', 'postgres')
+    source_db_password = os.getenv('SOURCE_DB_PASSWORD', 'password')
+
+    dest_db_host = os.getenv('DEST_DB_HOST', 'analytics')
+    dest_db_port = os.getenv('DEST_DB_PORT', '5432')
+    dest_db_name = os.getenv('DEST_DB_NAME', 'analytics')
+    dest_db_user = os.getenv('DEST_DB_USER', 'postgres')
+    dest_db_password = os.getenv('DEST_DB_PASSWORD', 'password')
+
+    backup_file_path = f'/tmp/backup_{source_db_name}.dump'
+
+    try:
+        # Step 1: Backup
+        backup_postgres_db(
+            source_host=source_db_host,
+            database_name=source_db_name,
+            port=source_db_port,
+            user=source_db_user,
+            password=source_db_password,
+            dest_file=backup_file_path,
+            logger=logger
+        )
+
+        # Step 2: Recreate destination DB to ensure it's clean
+        recreate_db(
+            db_host=dest_db_host,
+            database=dest_db_name,
+            db_port=dest_db_port,
+            user_name=dest_db_user,
+            user_password=dest_db_password,
+            logger=logger
+        )
+
+        # Step 3: Restore
+        restore_postgres_db(
+            db_host=dest_db_host,
+            db=dest_db_name,
+            port=dest_db_port,
+            user=dest_db_user,
+            password=dest_db_password,
+            backup_file=backup_file_path,
+            logger=logger
+        )
+
+        logger.info("Data extraction and loading completed successfully!")
+
+    except Exception as e:
+        logger.error(f"Pipeline failed: {e}")
+        exit(1)
 
 
 if __name__ == '__main__':
